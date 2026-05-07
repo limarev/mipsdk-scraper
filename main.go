@@ -10,9 +10,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
+
+	_ "net/http/pprof"
 )
 
 type bytes int
@@ -37,48 +42,9 @@ type FileDescription struct {
 	DatePublished string `json:"datePublished"`
 }
 
-type File struct {
-	Buffer []byte
-	Name   string
-	Size   bytes
-}
-
 type application struct {
 	errorLog *log.Logger
 	infoLog  *log.Logger
-}
-
-func (fd *FileDescription) download(results chan File, errors chan error, timeout time.Duration) {
-	resch := make(chan File, 1)
-	errch := make(chan error, 1)
-	go func() {
-		resp, err := http.Get(fd.Url)
-		if err != nil {
-			errch <- err
-		}
-		defer resp.Body.Close()
-
-		b, err := io.ReadAll(resp.Body)
-		if err != nil {
-			errch <- err
-		}
-
-		size, err := strconv.Atoi(fd.Size)
-		if err != nil {
-			errch <- err
-		}
-		f := File{Buffer: b, Name: fd.Name, Size: bytes(size)}
-		resch <- f
-	}()
-
-	select {
-	case <-time.After(timeout):
-		errors <- fmt.Errorf("%s timed out after %v", fd.Url, timeout)
-	case err := <-errch:
-		errors <- err
-	case res := <-resch:
-		results <- res
-	}
 }
 
 func (app *application) Scrape(url string) ([]FileDescription, error) {
@@ -111,7 +77,7 @@ func (app *application) Scrape(url string) ([]FileDescription, error) {
 	s1 := string(b[a:])
 	targetRune := ']'
 	a1 := strings.IndexRune(s1, targetRune)
-	if a == -1 {
+	if a1 == -1 {
 		return nil, fmt.Errorf("%s is invalid json array. Failed to find %c after %s", targetString, targetRune, targetString)
 	}
 
@@ -124,32 +90,6 @@ func (app *application) Scrape(url string) ([]FileDescription, error) {
 	}
 
 	return files, nil
-}
-
-func (app *application) dumpFiles(results chan File, errors chan error, dir string, files []FileDescription) {
-	i := 0
-	for range files {
-		select {
-		case file := <-results:
-			filePath := dir + string(os.PathSeparator) + file.Name
-			f, err := os.Create(filePath)
-			if err != nil {
-				app.errorLog.Print(err)
-			}
-			defer f.Close()
-
-			n, err := f.Write(file.Buffer)
-			if err != nil || n != int(file.Size) {
-				app.errorLog.Print(err)
-			}
-
-			i++
-
-			app.infoLog.Printf("%s is downloaded successfully: %s: %v out %v items", file.Name, file.Size, i, len(files))
-		case err := <-errors:
-			app.errorLog.Print(err)
-		}
-	}
 }
 
 func dumpVersion(downloadDir string, version string) (string, error) {
@@ -168,16 +108,58 @@ func dumpVersion(downloadDir string, version string) (string, error) {
 	return filePath, nil
 }
 
+func downloadFile(client *http.Client, url, downloadDir, fileName string) error {
+
+	filePath := filepath.Join(downloadDir, fileName)
+	output, err := os.Create(filePath)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", filePath, err)
+	}
+	defer output.Close()
+
+	res, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("download %s: %w", url, err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("download %s failed: %s", url, res.Status)
+	}
+
+	if _, err := io.Copy(output, res.Body); err != nil {
+		return fmt.Errorf("write %s: %w", fileName, err)
+	}
+
+	return nil
+}
+
 func main() {
 	dir := flag.String("dir", ".", "download dir")
 	url := flag.String("url", "https://aka.ms/mipsdkbins", "url for scraping")
 	timeout := flag.Int("timeout", 600, "downloading timeout per file in seconds")
 	isVersionOnlyMode := flag.Bool("version-only", false, "no downloading actually happens, returns mipsdk binaries version if found")
+	cpuprofile := flag.String("cpuprofile", "", "write cpu profile to file")
+	memprofile := flag.String("memprofile", "", "write memory profile to file")
+
 	flag.Parse()
 
 	app := &application{
 		infoLog:  log.New(os.Stdout, "INFO\t", log.Ldate|log.Ltime),
 		errorLog: log.New(os.Stderr, "ERROR\t", log.Ldate|log.Ltime|log.Lshortfile),
+	}
+
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			app.errorLog.Fatal(err)
+		}
+		defer f.Close()
+
+		if err := pprof.StartCPUProfile(f); err != nil {
+			app.errorLog.Fatal(err)
+		}
+		defer pprof.StopCPUProfile()
 	}
 
 	downloadDir, err := filepath.Abs(*dir)
@@ -220,13 +202,70 @@ func main() {
 
 		app.infoLog.Printf("%s is created successfully", versionPath)
 	} else {
-		results := make(chan File, len(files))
-		errors := make(chan error, len(files))
-
-		for _, file := range files {
-			go file.download(results, errors, time.Duration(*timeout)*time.Second)
+		transport := &http.Transport{
+			MaxIdleConns:        len(files),
+			MaxIdleConnsPerHost: len(files),
+			MaxConnsPerHost:     0,
+			DisableCompression:  true,
 		}
 
-		app.dumpFiles(results, errors, downloadDir, files)
+		client := &http.Client{
+			Transport: transport,
+			Timeout:   time.Duration(*timeout) * time.Second,
+		}
+
+		// files = files[28:31]
+		var wg sync.WaitGroup
+		wg.Add(len(files))
+
+		errors := make(chan error, len(files))
+
+		var counter int64
+		for _, file := range files {
+			go func(file FileDescription, errors chan error) {
+				defer wg.Done()
+
+				if err := downloadFile(client, file.Url, downloadDir, file.Name); err != nil {
+					errors <- err
+					return
+				}
+
+				size, err := strconv.Atoi(file.Size)
+				if err != nil {
+					errors <- fmt.Errorf("Error while converting %s to int", file.Size)
+					return
+				}
+
+				atomic.AddInt64(&counter, 1)
+				app.infoLog.Printf("%s is downloaded successfully: %v: %v out %v items", file.Name, bytes(size), atomic.LoadInt64(&counter), len(files))
+			}(file, errors)
+		}
+		wg.Wait()
+		close(errors)
+
+		var downloadFailed bool
+
+		for err := range errors {
+			if err != nil {
+				downloadFailed = true
+				app.errorLog.Print(err)
+			}
+		}
+
+		if downloadFailed {
+			app.errorLog.Fatal()
+		}
+
+		if *memprofile != "" {
+			f, err := os.Create(*memprofile)
+			if err != nil {
+				app.errorLog.Fatal(err)
+			}
+			defer f.Close()
+
+			if err := pprof.WriteHeapProfile(f); err != nil {
+				app.errorLog.Fatal(err)
+			}
+		}
 	}
 }
